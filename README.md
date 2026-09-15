@@ -22,8 +22,8 @@
 Требуется **Python 3.10+**.
 
 ```bash
-git clone <URL_РЕПОЗИТОРИЯ>
-cd tg-spotify-bio
+git clone https://github.com/aaaSaZaN/telegram-music-bio.git
+cd telegram-music-bio
 
 # Создаем виртуальное окружение
 python3 -m venv venv
