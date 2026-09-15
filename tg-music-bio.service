@@ -1,0 +1,15 @@
+[Unit]
+Description=Telegram Music Bio Updater (Last.fm & Spotify)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/tg-music-bio
+ExecStart=/opt/tg-music-bio/venv/bin/python3 main.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
