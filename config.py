@@ -16,5 +16,5 @@ LASTFM_USERNAME = os.getenv("LASTFM_USERNAME", "")
 
 # Settings
 DEFAULT_BIO = os.getenv("DEFAULT_BIO", "")  # If empty, saves current TG bio at startup
-UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL", "10"))
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "5"))  # Check music status every N seconds
 MAX_BIO_LENGTH = int(os.getenv("MAX_BIO_LENGTH", "70"))  # 70 for normal TG, 140 for TG Premium

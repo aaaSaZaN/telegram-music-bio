@@ -2,7 +2,6 @@ import asyncio
 import logging
 import signal
 import sys
-import time
 import aiohttp
 from telethon import TelegramClient
 from telethon.tl.functions.account import UpdateProfileRequest
@@ -88,15 +87,11 @@ def format_time(seconds: int) -> str:
     return f"{m:02d}:{s:02d}"
 
 
-def format_bio(artist: str, track: str, elapsed_sec: int, total_sec: int | None) -> str:
-    """Format bio: 'Сейчас играет: {artist} — {track} [{elapsed} / {total}]'."""
-    time_str = format_time(elapsed_sec)
-    if total_sec and total_sec > 0:
-        time_part = f" [{time_str} / {format_time(total_sec)}]"
-    else:
-        time_part = f" [{time_str}]"
-
+def format_bio(artist: str, track: str, total_sec: int | None) -> str:
+    """Format bio: 'сейчас слушает: {artist} — {track} ({duration})'."""
     prefix = "сейчас слушает: "
+    time_part = f" ({format_time(total_sec)})" if total_sec and total_sec > 0 else ""
+
     available_chars = config.MAX_BIO_LENGTH - len(prefix) - len(time_part)
     content = f"{artist} — {track}"
 
@@ -129,8 +124,6 @@ async def main():
 
     last_applied_bio = default_bio
     current_track_key = None
-    track_start_time = 0.0
-    track_duration = None
 
     async def shutdown(sig_name):
         nonlocal last_applied_bio
@@ -151,9 +144,9 @@ async def main():
             pass
 
     logger.info(
-        "✅ Запуск мониторинга 'Сейчас играет' (Last.fm: %s, интервал: %ds)",
+        "✅ Запуск мониторинга (Last.fm: %s, проверка каждые %ds, обновление Telegram только при смене трека)",
         config.LASTFM_USERNAME,
-        config.UPDATE_INTERVAL,
+        config.CHECK_INTERVAL,
     )
 
     async with aiohttp.ClientSession() as http_session:
@@ -165,47 +158,40 @@ async def main():
                     artist, track_name = track_info
                     track_key = (artist.lower(), track_name.lower())
 
-                    # Новый трек
+                    # Обновляем био в Telegram ТОЛЬКО если трек изменился
                     if track_key != current_track_key:
                         current_track_key = track_key
-                        track_start_time = time.time()
                         track_duration = await fetch_track_duration(http_session, artist, track_name)
-                        logger.info("🎵 Обнаружен новый трек: %s — %s (длительность: %s)", artist, track_name, format_time(track_duration) if track_duration else "неизвестно")
+                        dur_text = format_time(track_duration) if track_duration else "неизвестно"
+                        logger.info("🎵 Новый трек: %s — %s (длина: %s)", artist, track_name, dur_text)
 
-                    elapsed_sec = int(time.time() - track_start_time)
-                    if track_duration and elapsed_sec > track_duration:
-                        elapsed_sec = track_duration
-
-                    new_bio = format_bio(artist, track_name, elapsed_sec, track_duration)
-
-                    if new_bio != last_applied_bio:
-                        try:
-                            await client(UpdateProfileRequest(about=new_bio))
-                            last_applied_bio = new_bio
-                            logger.info("🎧 Обновлено био: %s", new_bio)
-                        except FloodWaitError as e:
-                            logger.warning("Telegram FloodWait: ожидание %d сек...", e.seconds)
-                            await asyncio.sleep(e.seconds)
-                        except Exception as e:
-                            logger.error("Ошибка при обновлении профиля Telegram: %s", e)
+                        new_bio = format_bio(artist, track_name, track_duration)
+                        if new_bio != last_applied_bio:
+                            try:
+                                await client(UpdateProfileRequest(about=new_bio))
+                                last_applied_bio = new_bio
+                                logger.info("🎧 Обновлено био в Telegram: %s", new_bio)
+                            except FloodWaitError as e:
+                                logger.warning("Telegram FloodWait: ожидание %d сек...", e.seconds)
+                                await asyncio.sleep(e.seconds)
+                            except Exception as e:
+                                logger.error("Ошибка при обновлении профиля Telegram: %s", e)
                 else:
                     # Музыка на паузе или выключена
-                    current_track_key = None
-                    track_start_time = 0.0
-                    track_duration = None
+                    if current_track_key is not None:
+                        current_track_key = None
+                        if last_applied_bio != default_bio:
+                            try:
+                                await client(UpdateProfileRequest(about=default_bio))
+                                last_applied_bio = default_bio
+                                logger.info("⏸ Музыка остановлена. Восстановлено исходное био: '%s'", default_bio)
+                            except FloodWaitError as e:
+                                logger.warning("Telegram FloodWait: ожидание %d сек...", e.seconds)
+                                await asyncio.sleep(e.seconds)
+                            except Exception as e:
+                                logger.error("Ошибка при восстановлении био: %s", e)
 
-                    if last_applied_bio != default_bio:
-                        try:
-                            await client(UpdateProfileRequest(about=default_bio))
-                            last_applied_bio = default_bio
-                            logger.info("⏸ Музыка остановлена. Восстановлено био: '%s'", default_bio)
-                        except FloodWaitError as e:
-                            logger.warning("Telegram FloodWait: ожидание %d сек...", e.seconds)
-                            await asyncio.sleep(e.seconds)
-                        except Exception as e:
-                            logger.error("Ошибка при восстановлении био: %s", e)
-
-                await asyncio.sleep(config.UPDATE_INTERVAL)
+                await asyncio.sleep(config.CHECK_INTERVAL)
 
         except asyncio.CancelledError:
             pass
