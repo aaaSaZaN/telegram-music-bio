@@ -21,7 +21,14 @@ running = True
 
 
 async def fetch_current_lastfm_track(session: aiohttp.ClientSession):
-    """Fetch current playing track from Last.fm API."""
+    """
+    Fetch current playing track from Last.fm API.
+
+    Returns:
+        (artist, track_name) if track is currently playing.
+        None if Last.fm successfully responded and no track is playing.
+        False if an API / network error occurred (temporary glitch).
+    """
     url = "https://ws.audioscrobbler.com/2.0/"
     params = {
         "method": "user.getrecenttracks",
@@ -35,8 +42,8 @@ async def fetch_current_lastfm_track(session: aiohttp.ClientSession):
     try:
         async with session.get(url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as resp:
             if resp.status != 200:
-                logger.warning("Last.fm returned HTTP %s", resp.status)
-                return None
+                logger.warning("Last.fm returned HTTP %s (временный сбой API)", resp.status)
+                return False
             data = await resp.json()
             recent = data.get("recenttracks", {})
             tracks = recent.get("track", [])
@@ -53,8 +60,8 @@ async def fetch_current_lastfm_track(session: aiohttp.ClientSession):
                     return artist, track_name
             return None
     except Exception as e:
-        logger.warning("Error fetching Last.fm track: %s", e)
-        return None
+        logger.warning("Ошибка при запросе к Last.fm (временный сбой сети): %s", e)
+        return False
 
 
 async def fetch_track_duration(session: aiohttp.ClientSession, artist: str, track: str) -> int | None:
@@ -116,11 +123,18 @@ async def main():
     client = TelegramClient(config.SESSION_NAME, config.API_ID, config.API_HASH)
     await client.start()
 
-    # Получаем исходное описание профиля
+    # Определение дефолтного описания профиля
     full_user = await client(GetFullUserRequest("me"))
     initial_bio = full_user.full_user.about or ""
-    default_bio = config.DEFAULT_BIO if config.DEFAULT_BIO else initial_bio
-    logger.info("Исходное био аккаунта: '%s'", default_bio)
+
+    if config.DEFAULT_BIO:
+        default_bio = config.DEFAULT_BIO
+    elif "сейчас слушает" in initial_bio.lower() or "сейчас ничего не слушает" in initial_bio.lower():
+        default_bio = ""
+    else:
+        default_bio = initial_bio
+
+    logger.info("Дефолтное био при паузе/выключении: '%s'", default_bio)
 
     last_applied_bio = default_bio
     current_track_key = None
@@ -154,7 +168,12 @@ async def main():
             while running and client.is_connected():
                 track_info = await fetch_current_lastfm_track(http_session)
 
-                if track_info:
+                # При временных сбоях API Last.fm или сети не трогаем статус в Telegram
+                if track_info is False:
+                    await asyncio.sleep(config.CHECK_INTERVAL)
+                    continue
+
+                if track_info is not None:
                     artist, track_name = track_info
                     track_key = (artist.lower(), track_name.lower())
 
@@ -177,14 +196,14 @@ async def main():
                             except Exception as e:
                                 logger.error("Ошибка при обновлении профиля Telegram: %s", e)
                 else:
-                    # Музыка на паузе или выключена
+                    # Last.fm успешно ответил 200 OK, и музыки в эфире нет (пауза/выключено)
                     if current_track_key is not None:
                         current_track_key = None
                         if last_applied_bio != default_bio:
                             try:
                                 await client(UpdateProfileRequest(about=default_bio))
                                 last_applied_bio = default_bio
-                                logger.info("⏸ Музыка остановлена. Восстановлено исходное био: '%s'", default_bio)
+                                logger.info("⏸ Музыка остановлена. Восстановлено дефолтное био: '%s'", default_bio)
                             except FloodWaitError as e:
                                 logger.warning("Telegram FloodWait: ожидание %d сек...", e.seconds)
                                 await asyncio.sleep(e.seconds)
