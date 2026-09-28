@@ -3,6 +3,7 @@ import logging
 import signal
 import sys
 import aiohttp
+from aiohttp import web
 from telethon import TelegramClient
 from telethon.tl.functions.account import UpdateProfileRequest
 from telethon.tl.functions.users import GetFullUserRequest
@@ -26,9 +27,12 @@ async def fetch_current_lastfm_track(session: aiohttp.ClientSession):
 
     Returns:
         (artist, track_name) if track is currently playing.
-        None if Last.fm successfully responded and no track is playing.
-        False if an API / network error occurred (temporary glitch).
+        None if Last.fm responded 200 and no track is playing.
+        False if an API or network error occurred.
     """
+    if not config.LASTFM_API_KEY or not config.LASTFM_USERNAME:
+        return None
+
     url = "https://ws.audioscrobbler.com/2.0/"
     params = {
         "method": "user.getrecenttracks",
@@ -42,7 +46,7 @@ async def fetch_current_lastfm_track(session: aiohttp.ClientSession):
     try:
         async with session.get(url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as resp:
             if resp.status != 200:
-                logger.warning("Last.fm returned HTTP %s (временный сбой API)", resp.status)
+                logger.warning("Last.fm вернул HTTP %s (временный сбой API)", resp.status)
                 return False
             data = await resp.json()
             recent = data.get("recenttracks", {})
@@ -66,6 +70,9 @@ async def fetch_current_lastfm_track(session: aiohttp.ClientSession):
 
 async def fetch_track_duration(session: aiohttp.ClientSession, artist: str, track: str) -> int | None:
     """Fetch track duration in seconds from Last.fm."""
+    if not config.LASTFM_API_KEY:
+        return None
+
     url = "https://ws.audioscrobbler.com/2.0/"
     params = {
         "method": "track.getInfo",
@@ -100,7 +107,7 @@ def format_bio(artist: str, track: str, total_sec: int | None) -> str:
     time_part = f" ({format_time(total_sec)})" if total_sec and total_sec > 0 else ""
 
     available_chars = config.MAX_BIO_LENGTH - len(prefix) - len(time_part)
-    content = f"{artist} — {track}"
+    content = f"{artist} — {track}" if artist else track
 
     if len(content) > available_chars:
         content = content[: max(1, available_chars - 1)] + "…"
@@ -113,10 +120,6 @@ async def main():
 
     if not config.API_ID or not config.API_HASH:
         logger.error("API_ID или API_HASH не заданы в .env! Скопируйте .env.example в .env и укажите ключи.")
-        sys.exit(1)
-
-    if not config.LASTFM_API_KEY or not config.LASTFM_USERNAME:
-        logger.error("LASTFM_API_KEY или LASTFM_USERNAME не заданы в .env!")
         sys.exit(1)
 
     logger.info("Инициализация Telegram клиента...")
@@ -138,9 +141,12 @@ async def main():
 
     last_applied_bio = default_bio
     current_track_key = None
+    last_webhook_time = 0.0
+
+    runner = None
 
     async def shutdown(sig_name):
-        nonlocal last_applied_bio
+        nonlocal last_applied_bio, runner
         logger.info("Получен сигнал %s, восстанавливаем исходное био...", sig_name)
         try:
             await client(UpdateProfileRequest(about=default_bio))
@@ -148,6 +154,8 @@ async def main():
         except Exception as e:
             logger.error("Ошибка при восстановлении био: %s", e)
         finally:
+            if runner:
+                await runner.cleanup()
             await client.disconnect()
 
     loop = asyncio.get_running_loop()
@@ -157,64 +165,166 @@ async def main():
         except NotImplementedError:
             pass
 
-    logger.info(
-        "✅ Запуск мониторинга (Last.fm: %s, проверка каждые %ds, обновление Telegram только при смене трека)",
-        config.LASTFM_USERNAME,
-        config.CHECK_INTERVAL,
-    )
+    # ==========================================
+    # Webhook API для мобильного приложения (Android)
+    # ==========================================
+    if config.ENABLE_WEBHOOK:
+        async def handle_health(request):
+            return web.json_response({
+                "status": "ok",
+                "app": "TelegramMusicBio",
+                "current_bio": last_applied_bio,
+            })
+
+        async def handle_now_playing(request):
+            nonlocal last_applied_bio, current_track_key, last_webhook_time
+
+            # Проверка секретного ключа (если задан)
+            if config.WEBHOOK_SECRET:
+                token = request.headers.get("X-Api-Key")
+                if not token:
+                    auth_header = request.headers.get("Authorization", "")
+                    if auth_header.startswith("Bearer "):
+                        token = auth_header[7:].strip()
+                if token != config.WEBHOOK_SECRET:
+                    logger.warning("Попытка неавторизованного запроса к Webhook API")
+                    return web.json_response({"error": "Unauthorized"}, status=401)
+
+            try:
+                data = await request.json()
+            except Exception:
+                return web.json_response({"error": "Invalid JSON"}, status=400)
+
+            artist = str(data.get("artist", "")).strip()
+            track = str(data.get("track", "") or data.get("title", "")).strip()
+            is_playing = bool(data.get("playing", True))
+            raw_duration = data.get("duration")
+
+            duration_sec = None
+            if raw_duration:
+                try:
+                    if isinstance(raw_duration, (int, float)):
+                        duration_sec = int(raw_duration)
+                    elif isinstance(raw_duration, str):
+                        if ":" in raw_duration:
+                            parts = raw_duration.split(":")
+                            if len(parts) == 2:
+                                duration_sec = int(parts[0]) * 60 + int(parts[1])
+                        else:
+                            duration_sec = int(raw_duration)
+                except Exception:
+                    pass
+
+            last_webhook_time = loop.time()
+
+            if is_playing and (artist or track):
+                track_key = (artist.lower(), track.lower())
+                if track_key != current_track_key:
+                    current_track_key = track_key
+                    new_bio = format_bio(artist, track, duration_sec)
+                    if new_bio != last_applied_bio:
+                        try:
+                            await client(UpdateProfileRequest(about=new_bio))
+                            last_applied_bio = new_bio
+                            logger.info("📱 [Webhook] Обновлено био в Telegram: %s", new_bio)
+                        except FloodWaitError as e:
+                            logger.warning("Telegram FloodWait: ожидание %d сек...", e.seconds)
+                            return web.json_response({"status": "flood_wait", "wait_seconds": e.seconds}, status=429)
+                        except Exception as e:
+                            logger.error("Ошибка при обновлении профиля Telegram: %s", e)
+                            return web.json_response({"error": str(e)}, status=500)
+            else:
+                # Пауза или плеер закрыт
+                current_track_key = None
+                if last_applied_bio != default_bio:
+                    try:
+                        await client(UpdateProfileRequest(about=default_bio))
+                        last_applied_bio = default_bio
+                        logger.info("📱 [Webhook] Музыка остановлена. Восстановлено дефолтное био: '%s'", default_bio)
+                    except FloodWaitError as e:
+                        logger.warning("Telegram FloodWait: ожидание %d сек...", e.seconds)
+                        return web.json_response({"status": "flood_wait", "wait_seconds": e.seconds}, status=429)
+                    except Exception as e:
+                        logger.error("Ошибка при восстановлении био: %s", e)
+
+            return web.json_response({"status": "ok", "bio": last_applied_bio})
+
+        app = web.Application()
+        app.router.add_get("/health", handle_health)
+        app.router.add_post("/api/now-playing", handle_now_playing)
+
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, config.WEBHOOK_HOST, config.WEBHOOK_PORT)
+        await site.start()
+        logger.info("🚀 Webhook API запущен на http://%s:%d/api/now-playing", config.WEBHOOK_HOST, config.WEBHOOK_PORT)
+
+    # Режим работы
+    has_lastfm = bool(config.LASTFM_API_KEY and config.LASTFM_USERNAME)
+    if has_lastfm:
+        logger.info(
+            "✅ Запуск мониторинга Last.fm (%s, проверка каждые %ds)",
+            config.LASTFM_USERNAME,
+            config.CHECK_INTERVAL,
+        )
+    else:
+        logger.info("ℹ️ Last.fm не настроен. Мониторинг работает только через Webhook API.")
 
     async with aiohttp.ClientSession() as http_session:
         try:
             while running and client.is_connected():
-                track_info = await fetch_current_lastfm_track(http_session)
+                # Если с момента последнего вебхука с телефона прошло меньше 45 секунд,
+                # даем приоритет телефону и не опрашиваем Last.fm
+                phone_active = (loop.time() - last_webhook_time) < 45
 
-                # При временных сбоях API Last.fm или сети не трогаем статус в Telegram
-                if track_info is False:
-                    await asyncio.sleep(config.CHECK_INTERVAL)
-                    continue
+                if has_lastfm and not phone_active:
+                    track_info = await fetch_current_lastfm_track(http_session)
 
-                if track_info is not None:
-                    artist, track_name = track_info
-                    track_key = (artist.lower(), track_name.lower())
+                    # При сбое API не сбрасываем статус
+                    if track_info is not False:
+                        if track_info is not None:
+                            artist, track_name = track_info
+                            track_key = (artist.lower(), track_name.lower())
 
-                    # Обновляем био в Telegram ТОЛЬКО если трек изменился
-                    if track_key != current_track_key:
-                        current_track_key = track_key
-                        track_duration = await fetch_track_duration(http_session, artist, track_name)
-                        dur_text = format_time(track_duration) if track_duration else "неизвестно"
-                        logger.info("🎵 Новый трек: %s — %s (длина: %s)", artist, track_name, dur_text)
+                            if track_key != current_track_key:
+                                current_track_key = track_key
+                                track_duration = await fetch_track_duration(http_session, artist, track_name)
+                                dur_text = format_time(track_duration) if track_duration else "неизвестно"
+                                logger.info("🎵 [Last.fm] Новый трек: %s — %s (длина: %s)", artist, track_name, dur_text)
 
-                        new_bio = format_bio(artist, track_name, track_duration)
-                        if new_bio != last_applied_bio:
-                            try:
-                                await client(UpdateProfileRequest(about=new_bio))
-                                last_applied_bio = new_bio
-                                logger.info("🎧 Обновлено био в Telegram: %s", new_bio)
-                            except FloodWaitError as e:
-                                logger.warning("Telegram FloodWait: ожидание %d сек...", e.seconds)
-                                await asyncio.sleep(e.seconds)
-                            except Exception as e:
-                                logger.error("Ошибка при обновлении профиля Telegram: %s", e)
-                else:
-                    # Last.fm успешно ответил 200 OK, и музыки в эфире нет (пауза/выключено)
-                    if current_track_key is not None:
-                        current_track_key = None
-                        if last_applied_bio != default_bio:
-                            try:
-                                await client(UpdateProfileRequest(about=default_bio))
-                                last_applied_bio = default_bio
-                                logger.info("⏸ Музыка остановлена. Восстановлено дефолтное био: '%s'", default_bio)
-                            except FloodWaitError as e:
-                                logger.warning("Telegram FloodWait: ожидание %d сек...", e.seconds)
-                                await asyncio.sleep(e.seconds)
-                            except Exception as e:
-                                logger.error("Ошибка при восстановлении био: %s", e)
+                                new_bio = format_bio(artist, track_name, track_duration)
+                                if new_bio != last_applied_bio:
+                                    try:
+                                        await client(UpdateProfileRequest(about=new_bio))
+                                        last_applied_bio = new_bio
+                                        logger.info("🎧 Обновлено био в Telegram: %s", new_bio)
+                                    except FloodWaitError as e:
+                                        logger.warning("Telegram FloodWait: ожидание %d сек...", e.seconds)
+                                        await asyncio.sleep(e.seconds)
+                                    except Exception as e:
+                                        logger.error("Ошибка при обновлении профиля Telegram: %s", e)
+                        else:
+                            # Музыка в Last.fm остановлена
+                            if current_track_key is not None:
+                                current_track_key = None
+                                if last_applied_bio != default_bio:
+                                    try:
+                                        await client(UpdateProfileRequest(about=default_bio))
+                                        last_applied_bio = default_bio
+                                        logger.info("⏸ [Last.fm] Музыка остановлена. Восстановлено дефолтное био: '%s'", default_bio)
+                                    except FloodWaitError as e:
+                                        logger.warning("Telegram FloodWait: ожидание %d сек...", e.seconds)
+                                        await asyncio.sleep(e.seconds)
+                                    except Exception as e:
+                                        logger.error("Ошибка при восстановлении био: %s", e)
 
                 await asyncio.sleep(config.CHECK_INTERVAL)
 
         except asyncio.CancelledError:
             pass
         finally:
+            if runner:
+                await runner.cleanup()
             if client.is_connected():
                 try:
                     await client(UpdateProfileRequest(about=default_bio))
