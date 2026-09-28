@@ -69,29 +69,46 @@ async def fetch_current_lastfm_track(session: aiohttp.ClientSession):
 
 
 async def fetch_track_duration(session: aiohttp.ClientSession, artist: str, track: str) -> int | None:
-    """Fetch track duration in seconds from Last.fm."""
-    if not config.LASTFM_API_KEY:
-        return None
+    """Fetch track duration in seconds from Last.fm, with fallback to Deezer API."""
+    # 1. Пробуем получить длительность из базы Last.fm
+    if config.LASTFM_API_KEY:
+        url = "https://ws.audioscrobbler.com/2.0/"
+        params = {
+            "method": "track.getInfo",
+            "artist": artist,
+            "track": track,
+            "api_key": config.LASTFM_API_KEY,
+            "format": "json",
+        }
+        headers = {"User-Agent": f"TgMusicBio/1.0 ({config.LASTFM_USERNAME})"}
 
-    url = "https://ws.audioscrobbler.com/2.0/"
-    params = {
-        "method": "track.getInfo",
-        "artist": artist,
-        "track": track,
-        "api_key": config.LASTFM_API_KEY,
-        "format": "json",
-    }
-    headers = {"User-Agent": f"TgMusicBio/1.0 ({config.LASTFM_USERNAME})"}
+        try:
+            async with session.get(url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=4)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    dur_ms = data.get("track", {}).get("duration", "0")
+                    dur_sec = int(dur_ms) // 1000
+                    if dur_sec > 0:
+                        return dur_sec
+        except Exception:
+            pass
 
+    # 2. Fallback: у многих новинок, ремиксов и инди-треков в Last.fm длительность равна 0.
+    # Опрашиваем публичный каталог Deezer для точного получения длины композиции.
     try:
-        async with session.get(url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+        query = f"{artist} {track}".strip()
+        deezer_url = "https://api.deezer.com/search"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        async with session.get(deezer_url, params={"q": query, "limit": 3}, headers=headers, timeout=aiohttp.ClientTimeout(total=4)) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                dur_ms = data.get("track", {}).get("duration", "0")
-                dur_sec = int(dur_ms) // 1000
-                return dur_sec if dur_sec > 0 else None
+                for item in data.get("data", []):
+                    d_sec = item.get("duration")
+                    if d_sec and int(d_sec) > 0:
+                        return int(d_sec)
     except Exception:
         pass
+
     return None
 
 
