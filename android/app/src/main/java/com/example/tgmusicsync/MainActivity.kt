@@ -79,6 +79,12 @@ fun SyncAppScreen() {
         mutableStateOf(prefs.getString(MediaNotificationListener.KEY_LAST_STATUS, MediaNotificationListener.lastTrackInfo) ?: "Ожидание музыки...")
     }
 
+    LaunchedEffect(Unit) {
+        MediaNotificationListener.currentStatusFlow.collect { status ->
+            lastTrack = status
+        }
+    }
+
     // Обновление состояния при возвращении в приложение
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
