@@ -141,7 +141,8 @@ async def main():
 
     last_applied_bio = default_bio
     current_track_key = None
-    last_webhook_time = 0.0
+    is_spotify_playing = False
+    phone_state = {"artist": "", "track": "", "duration": None, "playing": False}
 
     runner = None
 
@@ -174,10 +175,12 @@ async def main():
                 "status": "ok",
                 "app": "TelegramMusicBio",
                 "current_bio": last_applied_bio,
+                "spotify_playing": is_spotify_playing,
+                "phone_playing": bool(phone_state.get("playing")),
             })
 
         async def handle_now_playing(request):
-            nonlocal last_applied_bio, current_track_key, last_webhook_time
+            nonlocal last_applied_bio, current_track_key, phone_state
 
             # Проверка секретного ключа (если задан)
             if config.WEBHOOK_SECRET:
@@ -215,7 +218,25 @@ async def main():
                 except Exception:
                     pass
 
-            last_webhook_time = loop.time()
+            phone_state = {
+                "artist": artist,
+                "track": track,
+                "duration": duration_sec,
+                "playing": is_playing,
+            }
+
+            # ПРИОРИТЕТ SPOTIFY:
+            # Если сейчас играет Spotify, статус телефона запоминается, но не перебивает био
+            if is_spotify_playing:
+                logger.info(
+                    "📱 [Webhook] Телефон прислал трек ('%s — %s'), но сейчас играет Spotify (приоритет у Spotify)",
+                    artist, track
+                )
+                return web.json_response({
+                    "status": "ok",
+                    "priority": "spotify",
+                    "bio": last_applied_bio,
+                })
 
             if is_playing and (artist or track):
                 track_key = (artist.lower(), track.lower())
@@ -234,7 +255,7 @@ async def main():
                             logger.error("Ошибка при обновлении профиля Telegram: %s", e)
                             return web.json_response({"error": str(e)}, status=500)
             else:
-                # Пауза или плеер закрыт
+                # Пауза или плеер закрыт на телефоне
                 current_track_key = None
                 if last_applied_bio != default_bio:
                     try:
@@ -263,7 +284,7 @@ async def main():
     has_lastfm = bool(config.LASTFM_API_KEY and config.LASTFM_USERNAME)
     if has_lastfm:
         logger.info(
-            "✅ Запуск мониторинга Last.fm (%s, проверка каждые %ds)",
+            "✅ Запуск мониторинга Last.fm / Spotify (%s, проверка каждые %ds, высший приоритет)",
             config.LASTFM_USERNAME,
             config.CHECK_INTERVAL,
         )
@@ -273,16 +294,14 @@ async def main():
     async with aiohttp.ClientSession() as http_session:
         try:
             while running and client.is_connected():
-                # Если с момента последнего вебхука с телефона прошло меньше 45 секунд,
-                # даем приоритет телефону и не опрашиваем Last.fm
-                phone_active = (loop.time() - last_webhook_time) < 45
-
-                if has_lastfm and not phone_active:
+                if has_lastfm:
                     track_info = await fetch_current_lastfm_track(http_session)
 
-                    # При сбое API не сбрасываем статус
+                    # При временных сетевых сбоях не сбрасываем статус
                     if track_info is not False:
                         if track_info is not None:
+                            # Spotify сейчас активно воспроизводит трек
+                            is_spotify_playing = True
                             artist, track_name = track_info
                             track_key = (artist.lower(), track_name.lower())
 
@@ -290,33 +309,52 @@ async def main():
                                 current_track_key = track_key
                                 track_duration = await fetch_track_duration(http_session, artist, track_name)
                                 dur_text = format_time(track_duration) if track_duration else "неизвестно"
-                                logger.info("🎵 [Last.fm] Новый трек: %s — %s (длина: %s)", artist, track_name, dur_text)
+                                logger.info("🎵 [Spotify] Новый трек: %s — %s (длина: %s)", artist, track_name, dur_text)
 
                                 new_bio = format_bio(artist, track_name, track_duration)
                                 if new_bio != last_applied_bio:
                                     try:
                                         await client(UpdateProfileRequest(about=new_bio))
                                         last_applied_bio = new_bio
-                                        logger.info("🎧 Обновлено био в Telegram: %s", new_bio)
+                                        logger.info("🎧 [Spotify] Обновлено био в Telegram: %s", new_bio)
                                     except FloodWaitError as e:
                                         logger.warning("Telegram FloodWait: ожидание %d сек...", e.seconds)
                                         await asyncio.sleep(e.seconds)
                                     except Exception as e:
                                         logger.error("Ошибка при обновлении профиля Telegram: %s", e)
                         else:
-                            # Музыка в Last.fm остановлена
-                            if current_track_key is not None:
-                                current_track_key = None
-                                if last_applied_bio != default_bio:
-                                    try:
-                                        await client(UpdateProfileRequest(about=default_bio))
-                                        last_applied_bio = default_bio
-                                        logger.info("⏸ [Last.fm] Музыка остановлена. Восстановлено дефолтное био: '%s'", default_bio)
-                                    except FloodWaitError as e:
-                                        logger.warning("Telegram FloodWait: ожидание %d сек...", e.seconds)
-                                        await asyncio.sleep(e.seconds)
-                                    except Exception as e:
-                                        logger.error("Ошибка при восстановлении био: %s", e)
+                            # Spotify остановлен / на паузе
+                            was_spotify = is_spotify_playing
+                            is_spotify_playing = False
+
+                            if was_spotify:
+                                logger.info("⏸ [Spotify] Воспроизведение Spotify остановлено.")
+                                # Если в данный момент играет музыка на телефоне, бесшовно переключаемся на неё
+                                if phone_state.get("playing") and (phone_state.get("artist") or phone_state.get("track")):
+                                    phone_artist = phone_state["artist"]
+                                    phone_track = phone_state["track"]
+                                    phone_dur = phone_state.get("duration")
+                                    current_track_key = (phone_artist.lower(), phone_track.lower())
+                                    new_bio = format_bio(phone_artist, phone_track, phone_dur)
+                                    if new_bio != last_applied_bio:
+                                        try:
+                                            await client(UpdateProfileRequest(about=new_bio))
+                                            last_applied_bio = new_bio
+                                            logger.info("📱 [Fallback] Переключено на играющий трек с телефона: %s", new_bio)
+                                        except Exception as e:
+                                            logger.error("Ошибка при переключении на телефон: %s", e)
+                                else:
+                                    current_track_key = None
+                                    if last_applied_bio != default_bio:
+                                        try:
+                                            await client(UpdateProfileRequest(about=default_bio))
+                                            last_applied_bio = default_bio
+                                            logger.info("⏸ Восстановлено дефолтное био: '%s'", default_bio)
+                                        except FloodWaitError as e:
+                                            logger.warning("Telegram FloodWait: ожидание %d сек...", e.seconds)
+                                            await asyncio.sleep(e.seconds)
+                                        except Exception as e:
+                                            logger.error("Ошибка при восстановлении био: %s", e)
 
                 await asyncio.sleep(config.CHECK_INTERVAL)
 
